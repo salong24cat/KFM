@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
@@ -152,19 +153,58 @@ def aliases_for(stn: str, ch: str, city: str, name: str) -> tuple[str, ...]:
 
 
 class Catalog:
+    REFRESH_INTERVAL = 6 * 60 * 60
+    RETRY_INTERVAL = 5 * 60
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._stations: list[Station] = []
-        self._by_id: dict[str, Station] = {}
+        self._stations = self._load_seed()
+        self._by_id = {station.id: station for station in self._stations}
         self._last_refresh = 0.0
-        self.refresh()
+        self._last_attempt = 0.0
+        self._refreshing = False
+        # Serve the bundled list immediately; the online directory can be slow or unavailable.
+        threading.Thread(target=self.refresh, daemon=True).start()
+
+    def _load_seed(self) -> list[Station]:
+        try:
+            rows = json.loads(
+                Path(__file__).with_name("stations_seed.json").read_text(encoding="utf-8")
+            )
+            stations: list[Station] = []
+            for item in rows:
+                stn = str(item["stn"])
+                ch = str(item.get("ch", ""))
+                city = str(item.get("city", ""))
+                name = str(item["name"])
+                stations.append(Station(
+                    id=str(item.get("id") or station_id(stn, ch, city)),
+                    name=name,
+                    stn=stn,
+                    ch=ch,
+                    city=city,
+                    region=str(item.get("region", "")),
+                    aliases=tuple(item.get("aliases") or aliases_for(stn, ch, city, name)),
+                ))
+            print(f"Loaded {len(stations)} fallback Korean FM stations", flush=True)
+            return stations
+        except FileNotFoundError:
+            print("Station seed not found; waiting for directory refresh", flush=True)
+        except Exception as exc:
+            print(f"Station seed load failed: {type(exc).__name__}", flush=True)
+        return []
 
     def refresh(self) -> None:
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+            self._last_attempt = time.time()
         try:
-            response = requests.get(DIRECTORY_URL, headers=UPSTREAM_HEADERS, timeout=15)
-            response.raise_for_status()
-            parser = ChannelParser()
-            parser.feed(response.text)
+            with requests.get(DIRECTORY_URL, headers=UPSTREAM_HEADERS, timeout=15) as response:
+                response.raise_for_status()
+                parser = ChannelParser()
+                parser.feed(response.text)
             stations: list[Station] = []
             seen: set[tuple[str, str, str]] = set()
             for item in parser.items:
@@ -199,14 +239,22 @@ class Catalog:
             print(f"Loaded {len(stations)} Korean FM stations", flush=True)
         except Exception as exc:
             print(f"Station directory refresh failed: {type(exc).__name__}: {exc}", flush=True)
+        finally:
             with self._lock:
-                self._last_refresh = time.time()
+                self._refreshing = False
 
     def stations(self) -> list[Station]:
-        if time.time() - self._last_refresh > 6 * 60 * 60:
-            threading.Thread(target=self.refresh, daemon=True).start()
+        now = time.time()
         with self._lock:
-            return list(self._stations)
+            should_refresh = (
+                now - self._last_refresh > self.REFRESH_INTERVAL
+                and now - self._last_attempt > self.RETRY_INTERVAL
+                and not self._refreshing
+            )
+            stations = list(self._stations)
+        if should_refresh:
+            threading.Thread(target=self.refresh, daemon=True).start()
+        return stations
 
     def get(self, sid: str) -> Optional[Station]:
         with self._lock:
