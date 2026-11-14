@@ -317,6 +317,28 @@ def upstream_url_allowed(url: str, station: Station) -> bool:
     )
 
 
+class UpstreamFailure(RuntimeError):
+    def __init__(self, stage: str, reason: str) -> None:
+        self.stage = stage
+        self.reason = reason
+        super().__init__(f"{stage}_{reason}")
+
+
+def upstream_error_code(exc: Exception) -> str:
+    if isinstance(exc, requests.HTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        return f"http_{status}" if status else "http_error"
+    if isinstance(exc, requests.Timeout):
+        return "timeout"
+    if isinstance(exc, requests.ConnectionError):
+        return "connection_error"
+    if isinstance(exc, (ValueError, TypeError, AttributeError)):
+        return "invalid_response"
+    if isinstance(exc, RuntimeError):
+        return "invalid_or_disallowed_url"
+    return type(exc).__name__.lower()
+
+
 def resolved_stream_url(station: Station) -> str:
     """Resolve a short-lived upstream URL, refreshing it before it can expire."""
     now = time.time()
@@ -332,12 +354,12 @@ def resolved_stream_url(station: Station) -> str:
         url = response.json().get("url")
         if not isinstance(url, str) or not upstream_url_allowed(url, station):
             raise RuntimeError("Upstream returned an unsupported stream URL")
-    except Exception:
+    except Exception as exc:
         with _url_cache_lock:
             stale = _url_cache.get(station.id)
             if stale and now < stale[1]:
                 return stale[2]
-        raise
+        raise UpstreamFailure("resolver", upstream_error_code(exc)) from exc
     with _url_cache_lock:
         _url_cache[station.id] = (now + URL_CACHE_TTL, now + URL_STALE_TTL, url)
     return url
@@ -349,8 +371,9 @@ def inspect_stream(station: Station) -> tuple[str, str, str]:
     headers = dict(UPSTREAM_HEADERS)
     headers["Accept-Encoding"] = "identity"
     headers["Range"] = "bytes=0-63"
-    response = requests.get(url, headers=headers, stream=True, timeout=(12, 20))
+    response = None
     try:
+        response = requests.get(url, headers=headers, stream=True, timeout=(12, 20))
         response.raise_for_status()
         if not upstream_url_allowed(response.url, station):
             raise RuntimeError("Stream redirected to a disallowed host")
@@ -363,8 +386,13 @@ def inspect_stream(station: Station) -> tuple[str, str, str]:
         if "ogg" in content_type or path.endswith(".ogg"):
             codec = "ogg"
         return url, "direct", codec
+    except UpstreamFailure:
+        raise
+    except Exception as exc:
+        raise UpstreamFailure("stream_probe", upstream_error_code(exc)) from exc
     finally:
-        response.close()
+        if response is not None:
+            response.close()
 
 
 def fetch_hls_segments(url: str, station: Station) -> tuple[float, list[tuple[int, str, float]]]:
@@ -763,8 +791,16 @@ class Handler(BaseHTTPRequestHandler):
                     "quality": f"Live {codec.upper()}",
                 })
             except Exception as exc:
-                print(f"Resolver failed for {station.name}: {type(exc).__name__}", flush=True)
-                self.send_json(502, {"error": "Could not resolve this station right now"})
+                diagnostic = (
+                    f"{exc.stage}_{exc.reason}"
+                    if isinstance(exc, UpstreamFailure)
+                    else f"stream_{upstream_error_code(exc)}"
+                )
+                print(f"Resolver failed for {station.name}: {diagnostic}", flush=True)
+                self.send_json(502, {
+                    "error": "Could not resolve this station right now",
+                    "diagnostic": diagnostic,
+                })
             return
         self.send_json(404, {"error": "Not found"})
 
